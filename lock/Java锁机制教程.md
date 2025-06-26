@@ -806,16 +806,342 @@ disruptor.handleEventsWithWorkerPool(worker1, worker2, worker3);
    disruptor.shutdown();
    ```
 
+## ThreadLocal：线程本地存储
+
+### 概述
+
+ThreadLocal提供了线程本地存储机制，每个线程都有自己独立的变量副本。这是一种避免同步的重要技术，常用于保存线程上下文信息。
+
+### 核心概念
+
+```mermaid
+graph TB
+    subgraph "ThreadLocal架构"
+        A[Thread线程1] --> B[ThreadLocalMap1]
+        C[Thread线程2] --> D[ThreadLocalMap2]
+        E[Thread线程3] --> F[ThreadLocalMap3]
+        
+        G[ThreadLocal变量] --> B
+        G --> D
+        G --> F
+        
+        B --> H[Value1线程1的值]
+        D --> I[Value2线程2的值]  
+        F --> J[Value3线程3的值]
+    end
+```
+
+### 基本用法
+
+#### 1. 创建ThreadLocal变量
+
+```java
+// 基本创建方式
+private static final ThreadLocal<String> threadLocal = new ThreadLocal<>();
+
+// 带初始值的创建方式
+private static final ThreadLocal<Integer> counter = ThreadLocal.withInitial(() -> 0);
+
+// 自定义初始化
+private static final ThreadLocal<Connection> connectionHolder = new ThreadLocal<Connection>() {
+    @Override
+    protected Connection initialValue() {
+        return createDatabaseConnection();
+    }
+};
+```
+
+#### 2. 使用ThreadLocal
+
+```java
+public class ThreadLocalExample {
+    private static final ThreadLocal<String> userContext = new ThreadLocal<>();
+    
+    public void processRequest(String userId) {
+        try {
+            // 设置线程上下文
+            userContext.set(userId);
+            
+            // 业务处理中可以随时获取
+            doBusinessLogic();
+            
+        } finally {
+            // 重要：清理ThreadLocal防止内存泄漏
+            userContext.remove();
+        }
+    }
+    
+    private void doBusinessLogic() {
+        String currentUser = userContext.get();
+        // 使用当前用户信息处理业务逻辑
+        System.out.println("处理用户 " + currentUser + " 的请求");
+    }
+}
+```
+
+### InheritableThreadLocal
+
+InheritableThreadLocal允许子线程继承父线程的ThreadLocal值：
+
+```java
+public class InheritableExample {
+    private static final InheritableThreadLocal<String> inheritableContext = 
+        new InheritableThreadLocal<>();
+    
+    public void parentThreadMethod() {
+        inheritableContext.set("父线程的值");
+        
+        // 创建子线程
+        new Thread(() -> {
+            // 子线程可以访问父线程设置的值
+            String inherited = inheritableContext.get(); // "父线程的值"
+            System.out.println("子线程继承的值: " + inherited);
+        }).start();
+    }
+}
+```
+
+### 常见使用场景
+
+#### 1. 用户上下文管理
+
+```java
+public class UserContext {
+    private static final ThreadLocal<User> currentUser = new ThreadLocal<>();
+    
+    public static void setCurrentUser(User user) {
+        currentUser.set(user);
+    }
+    
+    public static User getCurrentUser() {
+        return currentUser.get();
+    }
+    
+    public static void clear() {
+        currentUser.remove();
+    }
+}
+
+// 在Web过滤器中设置用户上下文
+public class UserContextFilter implements Filter {
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response, 
+                        FilterChain chain) throws IOException, ServletException {
+        try {
+            User user = getUserFromRequest(request);
+            UserContext.setCurrentUser(user);
+            chain.doFilter(request, response);
+        } finally {
+            UserContext.clear(); // 请求结束时清理
+        }
+    }
+}
+```
+
+#### 2. 数据库连接管理
+
+```java
+public class ConnectionManager {
+    private static final ThreadLocal<Connection> connectionHolder = 
+        ThreadLocal.withInitial(() -> {
+            try {
+                return DriverManager.getConnection(
+                    "jdbc:mysql://localhost:3306/test", "user", "password");
+            } catch (SQLException e) {
+                throw new RuntimeException(e);
+            }
+        });
+    
+    public static Connection getConnection() {
+        return connectionHolder.get();
+    }
+    
+    public static void closeConnection() {
+        Connection conn = connectionHolder.get();
+        if (conn != null) {
+            try {
+                conn.close();
+            } catch (SQLException e) {
+                // 处理异常
+            }
+            connectionHolder.remove();
+        }
+    }
+}
+```
+
+#### 3. 线程安全的日期格式化
+
+```java
+public class DateUtils {
+    // SimpleDateFormat不是线程安全的，使用ThreadLocal解决
+    private static final ThreadLocal<SimpleDateFormat> dateFormat = 
+        ThreadLocal.withInitial(() -> new SimpleDateFormat("yyyy-MM-dd HH:mm:ss"));
+    
+    public static String formatDate(Date date) {
+        return dateFormat.get().format(date);
+    }
+    
+    public static Date parseDate(String dateStr) throws ParseException {
+        return dateFormat.get().parse(dateStr);
+    }
+}
+```
+
+### 内存泄漏预防
+
+ThreadLocal的不当使用可能导致内存泄漏，特别是在Web应用和线程池环境中：
+
+#### 1. 问题原因
+
+```java
+// 错误示例：忘记清理ThreadLocal
+public class BadExample {
+    private static final ThreadLocal<BigObject> cache = new ThreadLocal<>();
+    
+    public void processRequest() {
+        cache.set(new BigObject()); // 设置大对象
+        // 处理请求
+        // 忘记清理！线程池复用时会保留这个大对象
+    }
+}
+```
+
+#### 2. 正确做法
+
+```java
+// 正确示例：始终清理ThreadLocal
+public class GoodExample {
+    private static final ThreadLocal<BigObject> cache = new ThreadLocal<>();
+    
+    public void processRequest() {
+        try {
+            cache.set(new BigObject());
+            // 处理请求
+        } finally {
+            cache.remove(); // 确保清理
+        }
+    }
+}
+```
+
+#### 3. 自动清理的ThreadLocal
+
+```java
+public class AutoCleanupThreadLocal<T> extends ThreadLocal<T> {
+    private final Supplier<T> supplier;
+    
+    public AutoCleanupThreadLocal(Supplier<T> supplier) {
+        this.supplier = supplier;
+    }
+    
+    @Override
+    protected T initialValue() {
+        return supplier.get();
+    }
+    
+    @Override
+    public void remove() {
+        T value = get();
+        if (value instanceof AutoCloseable) {
+            try {
+                ((AutoCloseable) value).close();
+            } catch (Exception e) {
+                // 记录日志
+            }
+        }
+        super.remove();
+    }
+}
+```
+
+### 性能特点
+
+#### 优势
+1. **无同步开销**：避免了锁竞争
+2. **高并发性能**：每个线程独立访问
+3. **简化编程**：无需显式传递上下文参数
+
+#### 劣势
+1. **内存占用**：每个线程都有独立副本
+2. **生命周期管理**：需要手动清理防止泄漏
+3. **调试困难**：线程间数据隔离增加调试复杂性
+
+### 最佳实践
+
+1. **及时清理**
+   ```java
+   public void handleRequest() {
+       try {
+           threadLocal.set(value);
+           // 处理逻辑
+       } finally {
+           threadLocal.remove(); // 必须清理
+       }
+   }
+   ```
+
+2. **使用try-with-resources模式**
+   ```java
+   public class ThreadLocalResource implements AutoCloseable {
+       private final ThreadLocal<String> threadLocal = new ThreadLocal<>();
+       
+       public ThreadLocalResource(String value) {
+           threadLocal.set(value);
+       }
+       
+       public String get() {
+           return threadLocal.get();
+       }
+       
+       @Override
+       public void close() {
+           threadLocal.remove();
+       }
+   }
+   
+   // 使用
+   try (ThreadLocalResource resource = new ThreadLocalResource("value")) {
+       // 使用resource
+   } // 自动清理
+   ```
+
+3. **在Web应用中使用过滤器统一管理**
+   ```java
+   public class ThreadLocalCleanupFilter implements Filter {
+       @Override
+       public void doFilter(ServletRequest request, ServletResponse response, 
+                           FilterChain chain) throws IOException, ServletException {
+           try {
+               chain.doFilter(request, response);
+           } finally {
+               // 清理所有ThreadLocal变量
+               cleanupAllThreadLocals();
+           }
+       }
+   }
+   ```
+
+### 适用场景
+
+1. **Web应用用户上下文**：在整个请求处理过程中保持用户信息
+2. **数据库连接管理**：为每个线程维护独立的数据库连接
+3. **事务管理**：保持事务上下文信息
+4. **安全上下文**：保存当前用户的权限信息
+5. **日志上下文**：在日志中自动包含请求ID等信息
+6. **国际化**：为每个线程保存语言环境信息
+
 ## 总结
 
-Java锁机制提供了从简单到复杂的各种同步工具：
+Java并发编程提供了从简单到复杂的各种同步和线程安全工具：
 
 1. **synchronized**：最基础，适合简单场景
 2. **ReentrantLock**：功能丰富，适合复杂场景
 3. **ReadWriteLock**：读写分离，适合读多写少
 4. **StampedLock**：性能最优，适合高并发读多写少
 5. **同步工具类**：适合复杂的线程协调
-6. **LMAX Disruptor**：无锁高性能，适合极高吞吐量场景
+6. **ThreadLocal**：线程隔离，避免同步开销
+7. **LMAX Disruptor**：无锁高性能，适合极高吞吐量场景
 
 选择合适的锁机制需要考虑：
 - 功能需求（中断、超时、公平性）

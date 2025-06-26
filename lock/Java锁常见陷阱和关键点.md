@@ -786,9 +786,180 @@ if (remainingCapacity < bufferSize * 0.1) {
 - 内存受限环境
 - 对GC敏感的应用（虽然Disruptor减少GC，但预分配会占用内存）
 
+## ThreadLocal相关陷阱
+
+### 1. 内存泄漏陷阱
+
+#### 问题描述
+ThreadLocal最常见的陷阱是内存泄漏，特别是在Web应用和线程池环境中。
+
+#### 陷阱示例
+```java
+// 危险：忘记清理ThreadLocal
+public class BadService {
+    private static final ThreadLocal<LargeObject> cache = new ThreadLocal<>();
+    
+    public void handleRequest() {
+        cache.set(new LargeObject()); // 设置大对象
+        // 处理请求...
+        // 忘记调用 cache.remove()！
+    }
+}
+```
+
+#### 原因分析
+- 线程池中的线程会被复用
+- ThreadLocal变量会一直保持对大对象的引用
+- 导致大对象无法被GC回收
+
+#### 解决方案
+```java
+// 正确：始终清理ThreadLocal
+public class GoodService {
+    private static final ThreadLocal<LargeObject> cache = new ThreadLocal<>();
+    
+    public void handleRequest() {
+        try {
+            cache.set(new LargeObject());
+            // 处理请求...
+        } finally {
+            cache.remove(); // 确保清理
+        }
+    }
+}
+```
+
+### 2. 父子线程传递陷阱
+
+#### 问题描述
+普通ThreadLocal无法在父子线程间传递值，InheritableThreadLocal虽然可以但有性能问题。
+
+#### 陷阱示例
+```java
+public class InheritanceTrap {
+    private static final ThreadLocal<String> context = new ThreadLocal<>();
+    
+    public void parentMethod() {
+        context.set("parent-value");
+        
+        new Thread(() -> {
+            String value = context.get(); // null！子线程获取不到
+            System.out.println(value);
+        }).start();
+    }
+}
+```
+
+#### 解决方案
+```java
+// 方案1：使用InheritableThreadLocal
+private static final InheritableThreadLocal<String> context = 
+    new InheritableThreadLocal<>();
+
+// 方案2：显式传递
+public void parentMethod() {
+    String contextValue = context.get();
+    
+    new Thread(() -> {
+        // 显式传递上下文
+        processWithContext(contextValue);
+    }).start();
+}
+```
+
+### 3. 线程池复用陷阱
+
+#### 问题描述
+在线程池环境中，线程会被复用，可能导致上一个任务的ThreadLocal值影响下一个任务。
+
+#### 陷阱示例
+```java
+public class ThreadPoolTrap {
+    private static final ThreadLocal<User> currentUser = new ThreadLocal<>();
+    
+    @Async
+    public void asyncTask1() {
+        currentUser.set(new User("Alice"));
+        // 处理任务，但忘记清理
+    }
+    
+    @Async 
+    public void asyncTask2() {
+        User user = currentUser.get(); // 可能得到Alice！
+        // 这个任务本应该没有用户上下文
+    }
+}
+```
+
+#### 解决方案
+```java
+// 在任务开始时重置ThreadLocal
+@Async
+public void asyncTask() {
+    currentUser.remove(); // 先清理
+    try {
+        // 处理任务
+    } finally {
+        currentUser.remove(); // 任务结束后清理
+    }
+}
+```
+
+### 4. Web应用中的陷阱
+
+#### 问题描述
+在Web应用中，请求处理线程可能被复用，导致不同请求间的数据污染。
+
+#### 解决方案：过滤器统一管理
+```java
+public class ThreadLocalCleanupFilter implements Filter {
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response, 
+                        FilterChain chain) throws IOException, ServletException {
+        try {
+            chain.doFilter(request, response);
+        } finally {
+            // 清理所有可能的ThreadLocal变量
+            UserContext.clear();
+            SecurityContext.clear();
+            RequestContext.clear();
+        }
+    }
+}
+```
+
+### 5. 性能陷阱
+
+#### 问题描述
+过度使用ThreadLocal或在ThreadLocal中存储大对象会影响性能。
+
+#### 最佳实践
+```java
+// 避免存储大对象
+private static final ThreadLocal<ExpensiveObject> expensive = new ThreadLocal<>(); // 不好
+
+// 改为存储轻量级标识
+private static final ThreadLocal<String> objectId = new ThreadLocal<>();
+
+// 通过ID获取真正的对象
+public ExpensiveObject getObject() {
+    String id = objectId.get();
+    return id != null ? cache.get(id) : null;
+}
+```
+
+### ThreadLocal最佳实践总结
+
+1. **始终清理**：在finally块中调用remove()
+2. **尽早清理**：不要等到线程结束才清理
+3. **统一管理**：在Web应用中使用过滤器统一清理
+4. **避免大对象**：不要在ThreadLocal中存储大对象
+5. **谨慎继承**：考虑是否真的需要InheritableThreadLocal
+6. **监控内存**：定期检查是否有ThreadLocal导致的内存泄漏
+
 ## 总结
 
-Java锁的使用需要特别注意以下关键点：
+Java并发编程的使用需要特别注意以下关键点：
 
 1. **死锁预防**：使用锁顺序、超时机制、死锁检测
 2. **锁泄漏避免**：始终在finally中释放锁
@@ -796,7 +967,8 @@ Java锁的使用需要特别注意以下关键点：
 4. **内存可见性**：正确理解volatile和synchronized的作用
 5. **锁对象选择**：避免使用String、this作为锁对象
 6. **异常安全**：确保异常情况下锁能正确释放
-7. **测试验证**：充分测试并发场景
-8. **正确使用Disruptor**：合理设置参数、处理异常、选择合适场景
+7. **ThreadLocal管理**：及时清理避免内存泄漏，谨慎在线程池中使用
+8. **测试验证**：充分测试并发场景
+9. **正确使用Disruptor**：合理设置参数、处理异常、选择合适场景
 
 遵循这些最佳实践，可以帮助你编写出安全、高效的并发代码。对于极高性能要求的场景，Disruptor提供了无锁的解决方案，但也需要正确理解和使用。 
